@@ -259,7 +259,7 @@ sudo apt install tmux -y
 tmux new -s reality
 ```
 
-Start your validator node (replace the placeholders with your actual values):
+Start your L0 validator node (replace the placeholders with your actual values):
 
 ```bash
 # Use wildcard to match any version
@@ -294,6 +294,45 @@ Press `Ctrl+B`, then press `D`
 ```bash
 tmux attach -t reality
 ```
+
+Start your L1 validator node (replace the placeholders with your actual values):
+
+```bash
+# Use wildcard to match any version
+java -Xms1g -Xmx1g -jar reality-dag-l1-assembly.jar run-validator \
+  --keystore key.p12 \
+  --keyalias <alias> \
+  --password <password> \
+  --public-port 9100 \
+  --p2p-port 9101 \
+  --cli-port 9102 \
+  --l0-peer-id <id> \
+  --l0-peer-host <l0_peer_ip> \
+  --l0-peer-port 9000 \
+  --ip <your_ip> \
+  --collateral 0 \
+  --aci-db-path aci
+```
+
+**Example with placeholder values (assuming same server as L0):**
+```bash
+java -Xms1g -Xmx1g -jar reality-dag-l1-assembly.jar run-validator \
+  --keystore node.p12 \
+  --keyalias node \
+  --password MySecurePass123 \
+  --public-port 9100 \
+  --p2p-port 9101 \
+  --cli-port 9102 \
+  --l0-peer-id a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456789012345678901234567890abcdef1234567890abcdef1234567890abcdef1234 \
+  --l0-peer-host 185.216.177.201 \
+  --l0-peer-port 9000 \
+  --ip 185.216.177.201 \
+  --collateral 0 \
+  --aci-db-path aci
+```
+
+**Detach from tmux** (node keeps running in background):
+Press `Ctrl+B`, then press `D`
 
 ---
 
