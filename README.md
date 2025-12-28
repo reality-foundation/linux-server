@@ -364,7 +364,9 @@ You should see JSON output with your node information:
 
 Once your node shows `"state": "ReadyToJoin"`, you can join the network cluster.
 
-Run the join command (outside of tmux, in a separate terminal):
+### Primary Bootstrap Node (Genesis)
+
+Try the genesis node first:
 
 ```bash
 curl -X POST http://127.0.0.1:9002/cluster/join \
@@ -376,7 +378,33 @@ curl -X POST http://127.0.0.1:9002/cluster/join \
   }'
 ```
 
-> **Note:** The peer ID and IP in this command are for the network's bootstrap node. Check the official documentation or community channels for current bootstrap node information.
+### Alternative Bootstrap Nodes (If Genesis is Unavailable)
+
+If the genesis node is offline or unreachable, you can join via one of the validator nodes:
+
+**Validator 1:**
+```bash
+curl -X POST http://127.0.0.1:9002/cluster/join \
+  -H 'Content-type: application/json' \
+  -d '{
+    "id": "1111110d4d295665f6b2083b6bc8463f791cc0903efccafbce0ca5dfe7ff566949a115567c2a14993ef108de4033401ac10142965714c647beb5acaf49a1b24e",
+    "ip": "68.183.10.93",
+    "p2pPort": 9001
+  }'
+```
+
+**Validator 2:**
+```bash
+curl -X POST http://127.0.0.1:9002/cluster/join \
+  -H 'Content-type: application/json' \
+  -d '{
+    "id": "22222208770d62f27e8cd5b927f9c743ae0acda57f77532bf82be73ed36a59c74240c122dbb725216310f77ade4567d54f2a0361941e27e69571f74cfed326ca",
+    "ip": "128.199.67.191",
+    "p2pPort": 9001
+  }'
+```
+
+> **Note:** Try the genesis node first. Only use the validator nodes if genesis is unavailable. All three nodes are part of the same Reality Network, so you can join through any of them.
 
 ---
 
@@ -527,7 +555,18 @@ sudo lsof -i :9000
 ### Can't join cluster
 - Verify your node is in `ReadyToJoin` state
 - Check firewall ports are open
-- Ensure you can reach the bootstrap node: `curl http://143.110.227.9:9000/node/info`
+- Test connectivity to bootstrap nodes:
+  ```bash
+  # Test genesis node
+  curl http://143.110.227.9:9000/node/info
+  
+  # Test validator 1 (if genesis fails)
+  curl http://68.183.10.93:9000/node/info
+  
+  # Test validator 2 (if both above fail)
+  curl http://128.199.67.191:9000/node/info
+  ```
+- If all bootstrap nodes are unreachable, check your network/firewall settings
 
 ### Connection refused on port 9002
 The CLI port (9002) only accepts connections from localhost (127.0.0.1). Make sure you're running the join command from the same server.
@@ -559,10 +598,18 @@ The CLI port (9002) only accepts connections from localhost (127.0.0.1). Make su
 | `java -jar reality-keytool-*.jar generate --keystore node.p12 --keyalias node --password PASS` | Generate keystore |
 | `java -jar reality-wallet-*.jar show-id` | Show node ID (set env vars first) |
 | `curl http://IP:9000/node/info` | Check node status |
-| `curl -X POST http://127.0.0.1:9002/cluster/join ...` | Join cluster |
+| `curl -X POST http://127.0.0.1:9002/cluster/join ...` | Join cluster (see Step 11 for bootstrap node options) |
 | `tmux new -s reality` | Start tmux session |
 | `tmux attach -t reality` | Reattach to tmux |
 | `Ctrl+B, D` | Detach from tmux |
+
+### Bootstrap Nodes
+
+| Node | IP | Port | Node ID (first 16 chars) |
+|------|----|----|----------|
+| Genesis (Primary) | 143.110.227.9 | 9001 | 0000003264c7c850... |
+| Validator 1 | 68.183.10.93 | 9001 | 1111110d4d295665... |
+| Validator 2 | 128.199.67.191 | 9001 | 22222208770d62f2... |
 
 ---
 
