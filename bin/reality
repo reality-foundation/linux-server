@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+#
+# reality - look after a Reality Network node.
+
+set -uo pipefail
+
+CONF=/opt/reality/node.conf
+SECRETS=/opt/reality/node.env
+PREFIX=/opt/reality
+DATA=/opt/reality
+SERVICE=reality-node.service
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
+    G=$'\033[32m'; Y=$'\033[33m'; E=$'\033[31m'; C=$'\033[36m'
+else B=""; D=""; R=""; G=""; Y=""; E=""; C=""; fi
+
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf8*|*UTF8*) TL="╭" TR="╮" BL="╰" BR="╯" HZ="─" VT="│" OK="✓" NO="✗" WARN="⚠" DOT="●" MID="·" ;;
+    *) TL="+" TR="+" BL="+" BR="+" HZ="-" VT="|" OK="+" NO="x" WARN="!" DOT="*" MID="-" ;;
+esac
+
+W=58
+hr(){ local n="$1" c="$2" s=""; while (( n-- > 0 )); do s+="$c"; done; printf '%s' "$s"; }
+btop(){ printf '   %s%s%s%s%s\n' "$D" "$TL" "$(hr $W "$HZ")" "$TR" "$R"; }
+bbot(){ printf '   %s%s%s%s%s\n' "$D" "$BL" "$(hr $W "$HZ")" "$BR" "$R"; }
+brow(){ local t="$1" pad=$(( W - 1 - ${#1} )); (( pad < 0 )) && pad=0
+        printf '   %s%s%s %s%*s%s%s%s\n' "$D" "$VT" "$R" "$t" "$pad" "" "$D" "$VT" "$R"; }
+ok(){   printf '   %s%s%s %s\n' "$G" "$OK" "$R" "$1"; }
+warn(){ printf '   %s%s%s %s\n' "$Y" "$WARN" "$R" "$1"; }
+bad(){  printf '   %s%s%s %s\n' "$E" "$NO" "$R" "$1"; }
+note(){ printf '   %s%s %s%s\n' "$D" "$MID" "$1" "$R"; }
+
+need_root(){ [[ $EUID -eq 0 ]] || { echo "this needs root: sudo reality $*"; exit 1; }; }
+
+[[ -r $CONF ]] || { echo "No Reality node is installed on this machine."; exit 1; }
+# shellcheck disable=SC1090
+. "$CONF"
+# Secrets are only readable by root; commands that need them check for root first.
+# shellcheck disable=SC1090
+[[ -r $SECRETS ]] && . "$SECRETS"
+PUBLIC_PORT="${PUBLIC_PORT:-9000}"
+INFO="http://127.0.0.1:$PUBLIC_PORT/node/info"
+
+json(){ curl -fsS --max-time 5 "$INFO" 2>/dev/null; }
+
+# Read one field from JSON on stdin. Tolerates compact and pretty-printed output.
+jget(){
+    local j key="$1"
+    j=$(cat)
+    [[ -n $j ]] || return 0
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$j" | jq -r --arg k "$key" '.[$k] // empty' 2>/dev/null && return 0
+    fi
+    printf '%s' "$j" \
+        | grep -oE "\"$key\"[[:space:]]*:[[:space:]]*(\"[^\"]*\"|[0-9]+)" \
+        | head -1 | sed -E 's/.*:[[:space:]]*//; s/^"//; s/"$//'
+}
+
+# One line per node state, for people who have never seen one before.
+explain_state(){
+    case "$1" in
+        Ready)                echo "Fully synced and validating. Earning.";;
+        Observing)            echo "In the cluster and following the chain. Earning.";;
+        WaitingForReady)      echo "Synced, about to become a validator. Nearly there.";;
+        WaitingForObserving)  echo "Download done, joining consensus. Nearly there.";;
+        DownloadInProgress)   echo "Catching up with the chain. Normal after install; can take a while.";;
+        RedownloadInProgress) echo "Re-syncing after falling behind. The watchdog is on it.";;
+        WaitingForDownload)   echo "Joined, waiting for the download to start.";;
+        SessionStarted)       echo "Join accepted, waiting for peers to connect back.";;
+        ReadyToJoin)          echo "Running but not in the cluster yet. The watchdog will join it.";;
+        Leaving)              echo "Leaving the cluster - usually a restart in progress.";;
+        Offline)              echo "Left the cluster. The watchdog will restart and rejoin.";;
+        "")                   echo "Not answering. Starting up, or stopped - check reality service-logs.";;
+        *)                    echo "";;
+    esac
+}
+
+# Balance and ordinal come from the same endpoint. Empty until the node has a snapshot.
+wallet_json(){
+    [[ -n ${WALLET_ADDRESS:-} ]] || return 0
+    curl -fsS --max-time 5 "http://127.0.0.1:$PUBLIC_PORT/net/$WALLET_ADDRESS/balance" 2>/dev/null
+}
+fmt_net(){ awk -v d="$1" 'BEGIN{ printf "%.4f", d/100000000 }'; }
+
+cmd_status(){
+    local state ordinal balance uptime latest current js wj
+    js=$(json)
+    state=$(printf '%s' "$js" | jget state)
+    wj=$(wallet_json)
+    ordinal=$(printf '%s' "$wj" | jget ordinal)
+    balance=$(printf '%s' "$wj" | jget balance)
+    current=$(basename "$(readlink -f "$PREFIX/current" 2>/dev/null)" 2>/dev/null)
+    uptime=$(systemctl show "$SERVICE" -p ActiveEnterTimestamp --value 2>/dev/null)
+    [[ -n $uptime ]] && uptime=$(( ( $(date +%s) - $(date -d "$uptime" +%s 2>/dev/null || echo "$(date +%s)") ) / 60 ))
+
+    printf '\n'
+    btop
+    local hint=""
+    if [[ $state == SessionStarted ]] && tail -n 400 "$DATA/logs/app.log" 2>/dev/null \
+            | grep -qE 'Joining to peer.*failed|Libp2pTransport\.scala'; then
+        hint=libp2p
+    fi
+    case "$state" in
+        Ready|Observing) brow " Status    $DOT live $MID $state" ;;
+        DownloadInProgress|RedownloadInProgress|WaitingForDownload|WaitingForObserving|WaitingForReady)
+                         brow " Status    $DOT syncing $MID $state" ;;
+        "")              brow " Status    $DOT not responding" ;;
+        *)               brow " Status    $DOT $state" ;;
+    esac
+    brow " Node ID   ${NODE_ID:0:8}${MID}${NODE_ID: -6}"
+    brow " Wallet    ${WALLET_ADDRESS:-unknown}"
+    if [[ -n ${ordinal:-} ]]; then
+        brow " Ordinal   $ordinal"
+        brow " Balance   $(fmt_net "${balance:-0}") NET"
+    else
+        brow " Ordinal   syncing"
+        brow " Balance   syncing"
+    fi
+    brow " Public    ${NODE_IP:-?}:$PUBLIC_PORT"
+    brow " Version   ${current:-unknown}"
+    [[ -n ${uptime:-} ]] && brow " Uptime    ${uptime} min"
+    bbot
+    ex=$(explain_state "$state")
+    [[ -n $ex ]] && printf '   %s%s%s  %s%s%s\n' "$B" "${state:-No response}" "$R" "$D" "$ex" "$R"
+    printf '\n'
+
+    if [[ $hint == libp2p ]]; then
+        warn "peers cannot connect to this node (libp2p timed out)"
+        note "make sure ports ${P2P_PORT:-9001} and ${LIBP2P_PORT:-9003} reach this machine - on a home"
+        note "connection that means forwarding them on your router; a VPS needs no forwarding"
+    fi
+    systemctl is-active --quiet "$SERVICE" && ok "node service running" || bad "node service is not running"
+    systemctl is-active --quiet reality-watchdog.timer && ok "watchdog armed $MID every 5 minutes" \
+        || warn "watchdog timer is not running"
+
+    latest=$(curl -fsS --max-time 10 https://api.github.com/repos/reality-foundation/linux-server/releases/latest 2>/dev/null \
+        | grep -m1 '"tag_name"' | cut -d'"' -f4)
+    if [[ -n ${latest:-} && -n ${current:-} && $latest != "$current" ]]; then
+        if [[ ${AUTO_UPDATE:-true} == true ]]; then
+            note "$latest is available - the watchdog will install it"
+        else
+            warn "$latest is available - run: sudo reality update"
+        fi
+    elif [[ -n ${latest:-} ]]; then
+        ok "running the latest release"
+    fi
+    printf '\n'
+}
+
+cmd_backup(){
+    local dest="${1:-$PWD}"
+    [[ -d $dest ]] || { echo "not a directory: $dest"; exit 1; }
+    need_root backup
+    cp "${CL_KEYSTORE:-$DATA/node.p12}" "$dest/node.p12.backup" || exit 1
+    chmod 0600 "$dest/node.p12.backup"
+    printf '\n'
+    ok "keystore copied to $dest/node.p12.backup"
+    printf '\n'
+    printf '   %s%s  Your keystore password:%s\n' "$Y" "$WARN" "$R"
+    printf '      %s%s%s\n' "$B" "${CL_PASSWORD:-<not set>}" "$R"
+    printf '\n'
+    printf '   %sStore both somewhere safe and off this machine.%s\n' "$D" "$R"
+    printf '   %sWithout them your node identity cannot be recovered.%s\n\n' "$D" "$R"
+}
+
+case "${1:-status}" in
+    status)  cmd_status ;;
+    logs)
+        # The node writes its own log files; the journal only has systemd's lines.
+        f="$DATA/logs/${2:-app}.log"
+        [[ -r $f ]] || { echo "no log at $f yet (the node may still be starting)"; exit 1; }
+        exec tail -n 100 -F "$f" ;;
+    service-logs) journalctl -u "$SERVICE" -n "${2:-50}" --no-pager ;;
+    watchdog-logs) journalctl -u reality-watchdog.service -n "${2:-50}" --no-pager ;;
+    id)      printf '%s\n' "${NODE_ID:-unknown}" ;;
+    address) printf '%s\n' "${WALLET_ADDRESS:-unknown}" ;;
+    balance) wj=$(wallet_json); b=$(printf '%s' "$wj" | jget balance)
+             [[ -n $b ]] && printf '%s NET\n' "$(fmt_net "$b")" || echo "syncing" ;;
+    version) basename "$(readlink -f "$PREFIX/current")" ;;
+    join)    need_root join; "$PREFIX/bin/reality-join.sh" ;;
+    restart) need_root restart; systemctl restart "$SERVICE"; ok "restarting"; ;;
+    start)   need_root start; systemctl start "$SERVICE"; ok "started" ;;
+    stop)    need_root stop; systemctl stop "$SERVICE"; ok "stopped"
+             systemctl is-active --quiet reality-watchdog.timer \
+                 && note "the watchdog will start it again within 5 minutes - use 'pause' to keep it stopped" ;;
+    pause)   need_root pause; systemctl stop reality-watchdog.timer; systemctl stop "$SERVICE"
+             ok "node stopped and watchdog paused $MID 'sudo reality resume' when ready" ;;
+    resume)  need_root resume; systemctl start "$SERVICE"; systemctl start reality-watchdog.timer
+             ok "node started and watchdog running" ;;
+    check)   need_root check; systemctl start reality-watchdog.service; ok "watchdog run triggered";
+             journalctl -u reality-watchdog.service -n 30 --no-pager ;;
+    update)  need_root update; AUTO_UPDATE=true "$PREFIX/bin/reality-watchdog.sh" ;;
+    rollback)
+        need_root rollback
+        cur=$(readlink -f "$PREFIX/current")
+        prev=$(for d in "$PREFIX"/releases/*/; do d=${d%/}; [[ $d == "$cur" ]] || echo "$d"; done | head -1)
+        [[ -n ${prev:-} ]] || { echo "no previous release to roll back to"; exit 1; }
+        systemctl stop "$SERVICE"; ln -sfn "${prev%/}" "$PREFIX/current"; systemctl start "$SERVICE"
+        ok "rolled back to $(basename "${prev%/}")" ;;
+    backup)  shift; cmd_backup "$@" ;;
+    *)
+        cat <<USAGE
+
+  reality <command>
+
+    status              how your node is doing
+    logs [name]         follow the raw node log (app, gossip, http, libp2p, transactions)
+    service-logs        what systemd says about the node service
+    watchdog-logs [n]   what the watchdog has been doing
+    check               run the watchdog now
+    id                  print your node id
+    address             print your wallet address
+    balance             print your NET balance
+    version             print the installed release
+    join                join the cluster now
+    start|stop|restart  control the node (sudo)
+    pause               stop the node and keep it stopped, watchdog off (sudo)
+    resume              start the node and the watchdog again (sudo)
+    update              check for and install a new release
+    rollback            go back to the previous release
+    backup [dir]        copy your keystore and show the password
+
+USAGE
+        ;;
+esac
