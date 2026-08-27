@@ -83,10 +83,14 @@ sudo apt install ufw -y
 sudo ufw allow 22/tcp      # SSH (don't lock yourself out!)
 sudo ufw allow 9000/tcp    # Public HTTP port
 sudo ufw allow 9001/tcp    # P2P port
-sudo ufw allow 9002/tcp    # CLI port
+sudo ufw allow 9003/tcp    # libp2p port
 sudo ufw enable
 sudo ufw status
 ```
+
+> **Do not open port 9002.** It is the CLI/admin port and must only be reachable from localhost. It already listens on 127.0.0.1 only; opening it in the firewall gains nothing and advertises it.
+>
+> If you also run an L1 node (see Step 9), open `9100/tcp` and `9101/tcp` as well.
 
 ---
 
@@ -119,9 +123,9 @@ ls -lh *.jar
 **Alternative: Manual download (if you know the version)**
 
 ```bash
-# Replace v0.13.0 and version string with the latest from GitHub Releases
-VERSION_TAG="v0.13.0"
-VERSION_STRING="0.0.0+996-a9c70fe2"
+# Replace with the latest tag and version string from GitHub Releases
+VERSION_TAG="v0.34.0"
+VERSION_STRING="0.0.0+1124-d541f36b"
 
 wget https://github.com/reality-foundation/linux-server/releases/download/${VERSION_TAG}/reality-core-assembly-${VERSION_STRING}.jar
 wget https://github.com/reality-foundation/linux-server/releases/download/${VERSION_TAG}/reality-keytool-assembly-${VERSION_STRING}.jar
@@ -203,24 +207,40 @@ You have two options for running your node:
 
 Systemd will auto-restart your node if it crashes and start it on boot.
 
-First, create the service file:
+First, put your keystore password in a file only root can read. It must never appear on a command line, because anything on the command line is visible to every user on the machine via `ps`, and the service file itself is world-readable.
+
+```bash
+sudo mkdir -p /etc/reality
+sudo tee /etc/reality/node.env > /dev/null <<EOF
+CL_KEYSTORE=/root/reality-node/node.p12
+CL_KEYALIAS=node
+CL_PASSWORD=YOUR_PASSWORD
+EOF
+sudo chmod 600 /etc/reality/node.env
+```
+
+The node reads `CL_KEYSTORE`, `CL_KEYALIAS` and `CL_PASSWORD` from its environment, so `--password` is not needed on the command line.
+
+Then create the service file:
 
 ```bash
 sudo nano /etc/systemd/system/reality-node.service
 ```
 
-Paste this (replace YOUR values):
+Paste this (replace `YOUR_SERVER_IP` and `YOUR_NODE_ID`, and the JAR filename with the one you downloaded):
 
 ```ini
 [Unit]
 Description=Reality Network Validator Node
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/root/reality-node
-ExecStart=/bin/bash -c 'java -Xms2g -Xmx2g -jar /root/reality-node/reality-core-assembly-*.jar run-validator --keystore /root/reality-node/node.p12 --password YOUR_PASSWORD --keyalias node --ip YOUR_SERVER_IP --collateral 0 --peer-id YOUR_NODE_ID --l0-ip YOUR_SERVER_IP --startup-port 9000'
+EnvironmentFile=/etc/reality/node.env
+ExecStart=/usr/bin/java -Xms2g -Xmx2g -jar /root/reality-node/reality-core-assembly-0.0.0+1124-d541f36b.jar run-validator --keystore /root/reality-node/node.p12 --keyalias node --ip YOUR_SERVER_IP --collateral 0 --peer-id YOUR_NODE_ID --l0-ip YOUR_SERVER_IP --startup-port 9000
 Restart=always
 RestartSec=10
 
@@ -228,7 +248,7 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-> **Note:** Replace `YOUR_PASSWORD`, `YOUR_SERVER_IP`, and `YOUR_NODE_ID` with your actual values. The `*` wildcard will match any version of the core JAR.
+> **Use the exact JAR filename, not a `*` wildcard.** A wildcard works only while exactly one core JAR exists. The moment you download a newer release next to the old one, the wildcard expands to two paths and Java fails to start. Update the filename in this file when you upgrade.
 
 Enable and start the service:
 
@@ -259,13 +279,19 @@ sudo apt install tmux -y
 tmux new -s reality
 ```
 
+Export your keystore details so the password stays off the command line (where `ps` would show it to every user):
+
+```bash
+export CL_KEYSTORE=./node.p12
+export CL_KEYALIAS=node
+read -s -p "Keystore password: " CL_PASSWORD; export CL_PASSWORD; echo
+```
+
 Start your L0 validator node (replace the placeholders with your actual values):
 
 ```bash
-# Use wildcard to match any version
-java -Xms2g -Xmx2g -jar reality-core-assembly-*.jar run-validator \
+java -Xms2g -Xmx2g -jar reality-core-assembly-0.0.0+1124-d541f36b.jar run-validator \
   --keystore node.p12 \
-  --password YOUR_SECURE_PASSWORD \
   --keyalias node \
   --ip YOUR_SERVER_IP \
   --collateral 0 \
@@ -276,9 +302,8 @@ java -Xms2g -Xmx2g -jar reality-core-assembly-*.jar run-validator \
 
 **Example with placeholder values:**
 ```bash
-java -Xms2g -Xmx2g -jar reality-core-assembly-*.jar run-validator \
+java -Xms2g -Xmx2g -jar reality-core-assembly-0.0.0+1124-d541f36b.jar run-validator \
   --keystore node.p12 \
-  --password MySecurePass123 \
   --keyalias node \
   --ip 185.216.177.201 \
   --collateral 0 \
@@ -295,14 +320,13 @@ Press `Ctrl+B`, then press `D`
 tmux attach -t reality
 ```
 
-Start your L1 validator node (replace the placeholders with your actual values):
+Start your L1 validator node (replace the placeholders with your actual values; download the `reality-dag-l1-assembly` JAR from the same release first, and use its exact filename):
 
 ```bash
 # Use wildcard to match any version
-java -Xms1g -Xmx1g -jar reality-dag-l1-assembly.jar run-validator \
+java -Xms1g -Xmx1g -jar reality-dag-l1-assembly-0.0.0+1124-d541f36b.jar run-validator \
   --keystore key.p12 \
   --keyalias <alias> \
-  --password <password> \
   --public-port 9100 \
   --p2p-port 9101 \
   --cli-port 9102 \
@@ -316,10 +340,9 @@ java -Xms1g -Xmx1g -jar reality-dag-l1-assembly.jar run-validator \
 
 **Example with placeholder values (assuming same server as L0):**
 ```bash
-java -Xms1g -Xmx1g -jar reality-dag-l1-assembly.jar run-validator \
+java -Xms1g -Xmx1g -jar reality-dag-l1-assembly-0.0.0+1124-d541f36b.jar run-validator \
   --keystore node.p12 \
   --keyalias node \
-  --password MySecurePass123 \
   --public-port 9100 \
   --p2p-port 9101 \
   --cli-port 9102 \
@@ -350,7 +373,7 @@ You should see JSON output with your node information:
 ```json
 {
   "state": "ReadyToJoin",
-  "version": "0.0.0+996-a9c70fe2",
+  "version": "0.0.0+1124-d541f36b",
   "host": "185.216.177.201",
   "publicPort": 9000,
   "p2pPort": 9001,
@@ -580,12 +603,12 @@ cd ~/reality-node
 
 export NODE_IP=$(curl -4 -s ifconfig.me)
 export NODE_ID="YOUR_NODE_ID"
-export NODE_PASSWORD="YOUR_SECURE_PASSWORD"
 
-# Use wildcard to automatically use the latest JAR version
-java -Xms2g -Xmx2g -jar reality-core-assembly-*.jar run-validator \
+# Password comes from the root-only file created in Step 9, never from this script.
+set -a; . /etc/reality/node.env; set +a
+
+java -Xms2g -Xmx2g -jar reality-core-assembly-0.0.0+1124-d541f36b.jar run-validator \
   --keystore node.p12 \
-  --password $NODE_PASSWORD \
   --keyalias node \
   --ip $NODE_IP \
   --collateral 0 \
@@ -652,9 +675,11 @@ The CLI port (9002) only accepts connections from localhost (127.0.0.1). Make su
 
 1. **Keep your keystore safe** — Back up `node.p12` securely
 2. **Use strong passwords** — Your keystore password protects your node identity
-3. **Keep your system updated** — Run `sudo apt update && sudo apt upgrade` regularly
-4. **Firewall** — Only open necessary ports
-5. **SSH hardening** — Consider using SSH keys instead of passwords
+3. **Never put the password on a command line** — anything in `ExecStart` or a shell command shows up in `ps` for every user on the machine, and systemd unit files are world-readable. Keep it in `/etc/reality/node.env` with mode `600` as shown in Step 9.
+4. **Keep the node's balance small** — a node is an always-on hot wallet. Move rewards to a cold address regularly so a compromised server does not mean a lost balance.
+5. **Keep your system updated** — Run `sudo apt update && sudo apt upgrade` regularly
+6. **Firewall** — Only open necessary ports (9000, 9001, 9003; never 9002)
+7. **SSH hardening** — Consider using SSH keys instead of passwords
 
 ---
 
@@ -688,5 +713,5 @@ The CLI port (9002) only accepts connections from localhost (127.0.0.1). Make su
 
 ---
 
-*Last updated: December 2025*
-*Guide version: 0.13.0*
+*Last updated: August 2026*
+*Guide version: 0.34.0*
