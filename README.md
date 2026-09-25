@@ -609,6 +609,280 @@ tmux new -s reality
 
 ---
 
+## Optional: Automatic ReadyToJoin Watchdog
+
+A validator may return to the `ReadyToJoin` state after a restart, update, or recovery. The following optional watchdog checks the local node state every 15 minutes and automatically sends the cluster join request when the node is `ReadyToJoin`.
+
+For all other node states, the watchdog takes no action.
+
+### Create the Watchdog Script
+
+```bash
+sudo nano /root/reality-node/watchdog.sh
+```
+
+Add:
+
+```bash
+#!/usr/bin/env bash
+
+INFO_API="http://127.0.0.1:9000"
+JOIN_API="http://127.0.0.1:9002"
+LOG="/root/reality-node/watchdog.log"
+
+# Reality genesis/bootstrap node
+GENESIS_ID="0000003264c7c8503da3d03b6021101a57b5eb933d887bb7e3fbf4b2a57c302dfc5008afb522059b1926e8220de1cfa9388183de60b376a7bd93268990d71157"
+GENESIS_IP="143.110.227.9"
+GENESIS_P2P_PORT="9001"
+
+log() {
+    echo "$(date '+%F %T') $*" >> "$LOG"
+}
+
+# Do nothing if the validator service is not running
+if ! systemctl is-active --quiet reality-node; then
+    log "Service is not running."
+    exit 0
+fi
+
+# Read the current node state
+INFO=$(curl -fsS --max-time 10 "$INFO_API/node/info" 2>/dev/null)
+
+if [ $? -ne 0 ] || [ -z "$INFO" ]; then
+    log "Could not reach node API."
+    exit 0
+fi
+
+STATE=$(echo "$INFO" | jq -r '.state // empty')
+
+log "Node state: $STATE"
+
+# Only act when ReadyToJoin
+if [ "$STATE" = "ReadyToJoin" ]; then
+    log "ReadyToJoin detected. Sending join request."
+
+    curl -sS --max-time 30 \
+      -X POST "$JOIN_API/cluster/join" \
+      -H 'Content-type: application/json' \
+      -d "{
+        \"id\": \"$GENESIS_ID\",
+        \"ip\": \"$GENESIS_IP\",
+        \"p2pPort\": $GENESIS_P2P_PORT
+      }" >> "$LOG" 2>&1
+
+    log "Join command executed."
+fi
+
+exit 0
+```
+
+Make the script executable:
+
+```bash
+sudo chmod +x /root/reality-node/watchdog.sh
+```
+
+The script uses `jq`. Install it if necessary:
+
+```bash
+sudo apt install jq -y
+```
+
+### Run Every 15 Minutes
+
+Edit the root crontab:
+
+```bash
+sudo crontab -e
+```
+
+Add:
+
+```cron
+*/15 * * * * /root/reality-node/watchdog.sh
+```
+
+Test the watchdog manually:
+
+```bash
+sudo /root/reality-node/watchdog.sh
+tail -20 /root/reality-node/watchdog.log
+```
+
+When the node is `ReadyToJoin`, the watchdog sends the join request to the genesis/bootstrap node. All other node states are left unchanged.
+
+---
+
+## Optional: Automatic Version Update Watchdog
+
+The following optional updater checks the latest Reality Linux Server GitHub release every 15 minutes.
+
+If the currently installed `reality-core-assembly` JAR already matches the latest release, no action is taken.
+
+If a newer release is available, the updater:
+
+1. Downloads the new core JAR.
+2. Stops the validator.
+3. Archives the previous JAR.
+4. Archives the existing `data` directory.
+5. Starts the validator with the new JAR.
+6. Displays the resulting node state.
+
+The `ReadyToJoin` watchdog above can then automatically rejoin the validator when it reaches that state.
+
+### Create the Update Script
+
+```bash
+sudo nano /root/reality-node/update.sh
+```
+
+Add:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+NODE_DIR="/root/reality-node"
+OLD_DIR="$NODE_DIR/old"
+
+mkdir -p "$OLD_DIR"
+cd "$NODE_DIR"
+
+echo "$(date '+%F %T') Checking for new Reality release..."
+
+LATEST_URL=$(curl -fsSL \
+  https://api.github.com/repos/reality-foundation/linux-server/releases/latest \
+  | jq -r '.assets[] | select(.name|test("^reality-core-assembly")) | .browser_download_url' \
+  | head -n1)
+
+if [[ -z "$LATEST_URL" || "$LATEST_URL" == "null" ]]; then
+    echo "Could not find Reality core JAR in latest release."
+    exit 1
+fi
+
+LATEST_FILE=$(basename "${LATEST_URL//%2B/+}")
+CURRENT_FILE=$(ls reality-core-assembly-*.jar 2>/dev/null | head -n1 || true)
+
+if [[ "$CURRENT_FILE" == "$LATEST_FILE" ]]; then
+    echo "Already on latest version: $CURRENT_FILE"
+    exit 0
+fi
+
+echo "New version found: $LATEST_FILE"
+echo "Current version: ${CURRENT_FILE:-none}"
+
+# Download the new release before stopping the validator
+TEMP_FILE="${LATEST_FILE}.download"
+
+wget -O "$TEMP_FILE" "$LATEST_URL"
+mv "$TEMP_FILE" "$LATEST_FILE"
+
+echo "Download complete. Stopping Reality node..."
+systemctl stop reality-node
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+# Archive previous JAR
+if [[ -n "$CURRENT_FILE" && -f "$CURRENT_FILE" ]]; then
+    mv "$CURRENT_FILE" "$OLD_DIR/"
+fi
+
+# Archive previous node data
+if [[ -d data ]]; then
+    mv data "data-$TIMESTAMP"
+fi
+
+echo "Starting Reality node..."
+systemctl start reality-node
+
+sleep 15
+
+echo "Node status:"
+curl -s http://127.0.0.1:9000/node/info | jq || true
+
+echo "$(date '+%F %T') Update finished."
+```
+
+Make it executable:
+
+```bash
+sudo chmod +x /root/reality-node/update.sh
+```
+
+### Create the Systemd Service
+
+```bash
+sudo nano /etc/systemd/system/reality-update.service
+```
+
+Add:
+
+```ini
+[Unit]
+Description=Reality Auto Updater
+
+[Service]
+Type=oneshot
+ExecStart=/root/reality-node/update.sh
+```
+
+### Create the 15-Minute Timer
+
+```bash
+sudo nano /etc/systemd/system/reality-update.timer
+```
+
+Add:
+
+```ini
+[Unit]
+Description=Check for Reality updates every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable the timer:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now reality-update.timer
+```
+
+Verify that it is scheduled:
+
+```bash
+systemctl list-timers reality-update.timer
+```
+
+You can manually run an update check with:
+
+```bash
+sudo systemctl start reality-update.service
+```
+
+and inspect its output with:
+
+```bash
+journalctl -u reality-update.service -n 50 --no-pager
+```
+
+### How the Two Optional Watchdogs Work Together
+
+The update watchdog checks GitHub every 15 minutes. If no new release exists, it does nothing.
+
+When a new release is found, it installs the new core JAR and restarts the validator. The ReadyToJoin watchdog independently checks the validator every 15 minutes. Once the updated validator reaches `ReadyToJoin`, it automatically sends the cluster join request.
+
+Neither watchdog contains the validator's keystore, wallet address, password, public IP, or private key.
+
+---
+
 ## Troubleshooting
 
 ### Java not found
